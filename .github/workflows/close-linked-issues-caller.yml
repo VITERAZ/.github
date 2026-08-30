@@ -1,0 +1,21 @@
+name: Close linked issues
+
+# Thin caller. The logic lives in VITERAZ/.github so a fix reaches every repo at
+# once; this file only says when to run it and what it may touch.
+#
+# No `branches:` filter on purpose. The called workflow skips pull requests
+# merged into this repo's default branch, where GitHub's own "Closes #12"
+# keyword already works — so this one file is correct whether the long-lived
+# branch here is called develop, staging, or anything else.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  close:
+    uses: VITERAZ/.github/.github/workflows/close-linked-issues.yml@main
