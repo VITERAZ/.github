@@ -1,0 +1,33 @@
+name: Discord PR notification
+
+# Thin caller. The logic lives in VITERAZ/.github so a fix reaches every repo at
+# once; this file only says when to run it and what it may touch. Copy it into
+# any repo that should announce its pull requests in Discord.
+#
+# `branches:` is the one line worth editing per repo — list the long-lived
+# branches that repo actually has. A repo with no develop should list main
+# alone, otherwise the filter silently never matches.
+#
+# `synchronize` is deliberately absent: a ping on every push to an open PR
+# drowns the channel and trains people to mute it.
+#
+# Needs a DISCORD_WEBHOOK_URL repository secret. Organisation secrets do not
+# reach private repositories on the free plan, so set it per repo:
+#
+#   gh secret set DISCORD_WEBHOOK_URL --repo VITERAZ/<repo>
+#
+# Until it is set the run logs a warning and passes, so adopting this file never
+# blocks a pull request.
+
+on:
+  pull_request:
+    branches: [develop, main]
+    types: [opened, reopened, ready_for_review, closed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    uses: VITERAZ/.github/.github/workflows/pr-notify.yml@main
+    secrets: inherit
