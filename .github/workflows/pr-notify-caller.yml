@@ -29,5 +29,5 @@ permissions:
 
 jobs:
   notify:
-    uses: VITERAZ/.github/.github/workflows/discord-pr-notify.yml@main
+    uses: VITERAZ/.github/.github/workflows/pr-notify.yml@main
     secrets: inherit
