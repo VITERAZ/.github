@@ -31,3 +31,10 @@ jobs:
   notify:
     uses: VITERAZ/.github/.github/workflows/pr-notify.yml@main
     secrets: inherit
+    # Optional; defaults to "@everyone". Only ever applied to pull requests into
+    # this repo's default branch, so a repo with a develop pings on releases
+    # only — but a repo whose default branch is its only long-lived branch pings
+    # on every PR, and probably wants something quieter here.
+    #
+    #   with:
+    #     mention: "@here"          # or "<@&ROLE_ID>", or "" for no ping
