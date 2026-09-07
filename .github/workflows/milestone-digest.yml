@@ -1,0 +1,237 @@
+name: Milestone digest
+
+# One scheduled job for the whole organisation, not a caller per repository.
+# It walks every repo VITERAZ owns, collects the milestones that are due soon or
+# already late, and posts a single Discord message with one embed per milestone.
+#
+# Why milestones and not issues: GitHub issues have no due date. Deadlines here
+# live on the weekly sprint milestone ("Tuần 2 - 31/08/2026 - 06/09/2026"), so a
+# milestone falling due is what "these issues are nearly out of time" means, and
+# every open issue still on it is what is at risk.
+#
+# Why it lives here rather than in each product repo:
+#
+#   * One message. A job per repo means a ping per repo on the same morning for
+#     what is really one question — what is late?
+#   * `schedule:` only ever runs from a repository's DEFAULT branch. In
+#     viteraz-apps that is main while day-to-day pull requests target develop, so
+#     a copy living there would sit dormant until the next release. The default
+#     branch here is main and this file lands straight on it.
+#   * Adding a repo to the digest takes no work: the loop discovers them.
+#
+# ORG_READ_TOKEN is required and is the whole reason this needs configuring.
+# GITHUB_TOKEN is scoped to the single repository a workflow runs in, so it
+# cannot see milestones in viteraz-apps or company_web from here. Use a
+# fine-grained personal access token, owned by the VITERAZ organisation:
+#
+#   Repository access : All repositories
+#   Permissions       : Metadata → Read-only, Issues → Read-only
+#
+# Read-only on issues and nothing else, so a leak exposes issue text and no
+# write path. Note this repository is public: the secret itself is not readable
+# without write access here, and pull requests from forks never receive it, but
+# a token with more scope than the two permissions above does not belong in it.
+# Fine-grained tokens expire — the job warns loudly when the call starts failing.
+#
+#   gh secret set ORG_READ_TOKEN --repo VITERAZ/.github
+#
+# Three things about `schedule:` worth knowing: cron is UTC with no timezone
+# field, so 0 2 * * * is 09:00 in Asia/Ho_Chi_Minh; GitHub runs scheduled jobs
+# on a best-effort queue, where five to thirty minutes late is normal and a run
+# can be dropped under load; and GitHub disables scheduled workflows after 60
+# days of repository inactivity. workflow_dispatch is here so the digest can be
+# fired by hand from the Actions tab, which is the only practical way to test a
+# change without waiting a day.
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      lead_days:
+        description: Days of notice before a milestone's due date.
+        type: number
+        default: 1
+      mention:
+        description: '"@everyone", "@here", "<@&ROLE_ID>", or empty for no ping.'
+        type: string
+        default: "@everyone"
+      max_issues:
+        description: Issues listed per milestone before the rest are summarised.
+        type: number
+        default: 15
+
+permissions:
+  contents: read
+
+env:
+  # `inputs` is empty on a scheduled run, so each falls back to its default.
+  LEAD_DAYS: ${{ inputs.lead_days || 1 }}
+  MENTION: ${{ inputs.mention || '@everyone' }}
+  MAX_ISSUES: ${{ inputs.max_issues || 15 }}
+  # Discord accepts at most 10 embeds in one message.
+  MAX_EMBEDS: 10
+
+jobs:
+  digest:
+    name: Report milestones due or overdue across the organisation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect milestones and post the digest
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "::warning::DISCORD_WEBHOOK_URL secret is not set; skipping."
+            exit 0
+          fi
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::ORG_READ_TOKEN secret is not set; skipping. GITHUB_TOKEN cannot read other repositories."
+            exit 0
+          fi
+
+          # Archived repos are history, and a repo with issues disabled has no
+          # milestones to carry. --paginate can emit one array per page, so the
+          # pages are added back together rather than assumed to be one.
+          gh api --paginate "orgs/${ORG}/repos?per_page=100&type=all" \
+            | jq -s 'add // []' \
+            | jq '[ .[] | select(.archived | not) | select(.has_issues) | .full_name ]' > repos.json
+          echo "Scanning $(jq length repos.json) repositories."
+
+          # Day arithmetic against midnight UTC rather than the moment the job
+          # starts, so a scheduled run and a manual rerun hours later agree on
+          # what "tomorrow" means. Only the date half of due_on is trusted:
+          # GitHub has returned both midnight and mid-morning in that field.
+          echo '[]' > due.json
+          jq -r '.[]' repos.json | while read -r REPO_FULL; do
+            # One unreadable repo must not take the whole digest down with it:
+            # a token narrowed to some repositories is a normal way to run this.
+            if ! gh api "repos/${REPO_FULL}/milestones?state=open&per_page=100" > milestones.json 2> gh-error.txt; then
+              echo "::warning::Cannot read milestones in ${REPO_FULL}: $(tail -n 1 gh-error.txt)"
+              continue
+            fi
+
+            jq --argjson lead "${LEAD_DAYS}" --arg repo "${REPO_FULL}" '
+              (((now / 86400) | floor) * 86400) as $today
+              | [ .[]
+                  | select(.due_on != null)
+                  | { repo: $repo, number, title, html_url,
+                      due: .due_on[0:10],
+                      days: (((((.due_on[0:10] + "T00:00:00Z") | fromdateiso8601) - $today) / 86400) | floor) }
+                  | select(.days <= $lead) ]
+            ' milestones.json > hits.json
+
+            jq -s '.[0] + .[1]' due.json hits.json > due.next
+            mv due.next due.json
+          done
+
+          # Most overdue first: the digest is read from the top and that is the
+          # part someone has to act on today.
+          jq 'sort_by(.days)' due.json > due.sorted
+          mv due.sorted due.json
+
+          TOTAL="$(jq 'length' due.json)"
+          REPOS_HIT="$(jq '[.[].repo] | unique | length' due.json)"
+          if [ "${TOTAL}" -eq 0 ]; then
+            echo "No milestone is due within ${LEAD_DAYS} day(s) or overdue; nothing to post."
+            exit 0
+          fi
+          echo "Reporting ${TOTAL} milestone(s) across ${REPOS_HIT} repository/repositories."
+
+          echo '[]' > embeds.json
+          jq -c --argjson n "${MAX_EMBEDS}" '.[:$n][]' due.json | while read -r MILESTONE; do
+            REPO_FULL="$(printf '%s' "${MILESTONE}" | jq -r '.repo')"
+            NUMBER="$(printf '%s' "${MILESTONE}" | jq -r '.number')"
+
+            # The issues endpoint returns pull requests too; they are not work
+            # items on the board and would inflate every count.
+            gh api "repos/${REPO_FULL}/issues?state=open&milestone=${NUMBER}&per_page=100" \
+              | jq '[ .[] | select(.pull_request == null)
+                      | { number, title, html_url, assignees: [.assignees[].login] } ]' > issues.json
+
+            # jq assembles the embed so issue titles — arbitrary user text, in
+            # any language — cannot break the JSON.
+            jq -n \
+              --argjson ms "${MILESTONE}" \
+              --slurpfile issues issues.json \
+              --argjson max "${MAX_ISSUES}" '
+              ($issues[0]) as $list
+              | ($list | length) as $total
+              | ($ms.repo | split("/") | last) as $short
+              | ($list[:$max]
+                 | map("[#\(.number)](\(.html_url)) \(.title)"
+                       + (if (.assignees | length) > 0
+                          then " — " + (.assignees | map("`" + . + "`") | join(", "))
+                          else " — _unassigned_" end))
+                 | join("\n")) as $lines
+              | {
+                  title: (if   $ms.days <  0 then "🔴 \($short) · \($ms.title)"
+                          elif $ms.days == 0 then "🟠 \($short) · \($ms.title)"
+                          else "⏰ \($short) · \($ms.title)" end),
+                  url: $ms.html_url,
+                  color: (if   $ms.days <  0 then 15158332   # red
+                          elif $ms.days == 0 then 16744192   # orange
+                          else 16097024 end),                # amber
+                  description: (if $total == 0
+                                then "_No open issues left on this milestone._"
+                                else $lines + (if $total > $max
+                                               then "\n… and \($total - $max) more"
+                                               else "" end) end),
+                  fields: [
+                    { name: "Due",  value: $ms.due, inline: true },
+                    { name: "Open", value: "\($total) issue(s)", inline: true },
+                    { name: "Status",
+                      value: (if   $ms.days <  0 then "\(-$ms.days) day(s) late"
+                              elif $ms.days == 0 then "due today"
+                              else "\($ms.days) day(s) left" end),
+                      inline: true }
+                  ],
+                  footer: { text: $ms.repo }
+                }' > embed.json
+
+            jq -s '.[0] + [.[1]]' embeds.json embed.json > embeds.next
+            mv embeds.next embeds.json
+          done
+
+          # The mention is the only thing that goes in `content`. Discord parses
+          # mentions there but not inside an embed, so every milestone and issue
+          # title stays on the embed side and a milestone named "@everyone"
+          # cannot ping the server on its own. allowed_mentions then caps what
+          # content itself is permitted to resolve.
+          SUMMARY="${TOTAL} milestone(s) due or overdue across ${REPOS_HIT} repo(s)"
+          if [ "${TOTAL}" -gt "${MAX_EMBEDS}" ]; then
+            SUMMARY="${SUMMARY} — showing the ${MAX_EMBEDS} most urgent"
+          fi
+
+          if [ -n "${MENTION}" ]; then
+            CONTENT="${MENTION} — ${SUMMARY}"
+            case "${MENTION}" in
+              *@everyone*|*@here*) PARSE='["everyone"]' ;;
+              *"<@&"*)             PARSE='["roles"]'    ;;
+              *)                   PARSE='[]'           ;;
+            esac
+          else
+            CONTENT="${SUMMARY}"
+            PARSE='[]'
+          fi
+
+          jq -n \
+            --slurpfile embeds embeds.json \
+            --arg content "${CONTENT}" \
+            --argjson parse "${PARSE}" '
+            {
+              username: "VITERAZ PR Bot",
+              content: $content,
+              allowed_mentions: { parse: $parse },
+              embeds: $embeds[0]
+            }' > payload.json
+
+          curl --silent --show-error --fail-with-body \
+            --retry 3 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -X POST -d @payload.json \
+            "${WEBHOOK_URL}"
