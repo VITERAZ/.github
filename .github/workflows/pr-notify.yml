@@ -20,6 +20,19 @@ name: Discord PR notification
 
 on:
   workflow_call:
+    inputs:
+      mention:
+        # Who gets pulled away from what they are doing. Only ever applied to
+        # pull requests into the default branch — see the ping block below — so
+        # a repo whose only long-lived branch is main pings on every PR, while a
+        # repo with a develop pings only on releases.
+        #
+        # "@everyone", "@here", "<@&ROLE_ID>" for one role, or "" to stay silent
+        # while still posting the embed.
+        type: string
+        default: "@everyone"
+        required: false
+        description: Mention prepended to pull requests into the default branch.
     secrets:
       DISCORD_WEBHOOK_URL:
         # Not required, so a repo that adopts the caller before someone sets the
@@ -41,6 +54,7 @@ jobs:
           # into the script: a PR title is attacker-controlled text, and `${{ }}`
           # inside a run block would paste it straight into the shell.
           WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MENTION: ${{ inputs.mention }}
           PR_ACTION: ${{ github.event.action }}
           PR_MERGED: ${{ github.event.pull_request.merged }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -87,6 +101,29 @@ jobs:
             TITLE_PREFIX="${TITLE_PREFIX} → ${PR_BASE}"
           fi
 
+          # Only a pull request into the default branch is worth interrupting
+          # anyone for. Review traffic on develop gets the embed and no ping:
+          # ping everything and the channel is muted within a week, which costs
+          # more than the notifications were ever worth.
+          #
+          # The mention goes in `content`, and nothing else does. Discord parses
+          # mentions in content but not inside an embed, so keeping every piece
+          # of pull-request text on the embed side means a PR titled "@everyone"
+          # cannot ping anyone. allowed_mentions then caps what content itself is
+          # allowed to resolve, so a mistake here stays a mistake instead of
+          # becoming a way to page the whole server.
+          if [ "${PR_BASE}" = "${DEFAULT_BRANCH}" ] && [ -n "${MENTION}" ]; then
+            CONTENT="${MENTION} — pull request into \`${PR_BASE}\`"
+            case "${MENTION}" in
+              *@everyone*|*@here*) PARSE='["everyone"]' ;;
+              *"<@&"*)             PARSE='["roles"]'    ;;
+              *)                   PARSE='[]'           ;;
+            esac
+          else
+            CONTENT=""
+            PARSE='[]'
+          fi
+
           # Discord caps embed descriptions at 4096 characters, and nobody reads
           # a wall of text in a notification anyway.
           DESCRIPTION="$(printf '%s' "${PR_BODY}" | head -c 400)"
@@ -105,9 +142,13 @@ jobs:
             --arg branches "\`${PR_HEAD}\` → \`${PR_BASE}\`" \
             --arg changes "+${PR_ADDITIONS} / -${PR_DELETIONS} in ${PR_FILES} file(s)" \
             --arg repo "${REPO}" \
+            --arg content "${CONTENT}" \
+            --argjson parse "${PARSE}" \
             --argjson color "${COLOR}" \
             '{
               username: "VITERAZ PR Bot",
+              content: $content,
+              allowed_mentions: { parse: $parse },
               embeds: [{
                 title: $title,
                 url: $url,
