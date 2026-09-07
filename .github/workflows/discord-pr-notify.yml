@@ -1,0 +1,130 @@
+name: Discord PR notification
+
+# Reusable across every VITERAZ repository. Callers own the trigger — which
+# branches matter and which pull request events are worth a ping differ per
+# repo — while this file owns the message, so a fix to the embed lands
+# everywhere at once.
+#
+# Why it exists: pull requests into a long-lived branch are review requests, and
+# a review request nobody sees is a PR that sits for two days. Pushing them into
+# the team's Discord puts them where the team already is.
+#
+# The webhook is a repository secret rather than an organisation one on purpose:
+# organisation Actions secrets do not reach private repositories on the free
+# plan, and every VITERAZ product repo is private. Each caller therefore needs
+# its own DISCORD_WEBHOOK_URL and `secrets: inherit`.
+#
+# Permissions are deliberately not declared here: a called workflow can never
+# hold more than its caller granted, so the caller is the single place that says
+# what this may touch. Declaring it in both spots only invites them to drift.
+
+on:
+  workflow_call:
+    secrets:
+      DISCORD_WEBHOOK_URL:
+        # Not required, so a repo that adopts the caller before someone sets the
+        # secret gets a warning instead of a red X on every pull request.
+        required: false
+        description: Discord webhook URL for the channel that should receive PR notifications.
+
+jobs:
+  notify:
+    name: Post the pull request to Discord
+    # A draft PR is a work-in-progress the author has not asked anyone to look
+    # at yet. It gets its ping later, on ready_for_review.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build and send Discord embed
+        env:
+          # Everything below arrives through env rather than being interpolated
+          # into the script: a PR title is attacker-controlled text, and `${{ }}`
+          # inside a run block would paste it straight into the shell.
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AVATAR: ${{ github.event.pull_request.user.avatar_url }}
+          PR_ADDITIONS: ${{ github.event.pull_request.additions }}
+          PR_DELETIONS: ${{ github.event.pull_request.deletions }}
+          PR_FILES: ${{ github.event.pull_request.changed_files }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "::warning::DISCORD_WEBHOOK_URL secret is not set; skipping."
+            exit 0
+          fi
+
+          # Headline and colour come from the event, so the channel is skimmable
+          # without opening anything.
+          case "${PR_ACTION}" in
+            opened)           TITLE_PREFIX="🆕 New PR"      ; COLOR=3447003  ;; # blue
+            reopened)         TITLE_PREFIX="♻️ PR reopened"  ; COLOR=3447003  ;;
+            ready_for_review) TITLE_PREFIX="👀 PR ready"     ; COLOR=16097024 ;; # amber
+            closed)
+              if [ "${PR_MERGED}" = "true" ]; then
+                TITLE_PREFIX="✅ PR merged"; COLOR=10181046               # purple
+              else
+                TITLE_PREFIX="❌ PR closed"; COLOR=15158332               # red
+              fi
+              ;;
+            *) TITLE_PREFIX="PR update"; COLOR=9807270 ;;
+          esac
+
+          # A PR into the default branch is a release, not day-to-day traffic.
+          # Naming the branch rather than hardcoding "main" keeps this correct in
+          # repos whose default is called something else.
+          if [ "${PR_BASE}" = "${DEFAULT_BRANCH}" ]; then
+            TITLE_PREFIX="${TITLE_PREFIX} → ${PR_BASE}"
+          fi
+
+          # Discord caps embed descriptions at 4096 characters, and nobody reads
+          # a wall of text in a notification anyway.
+          DESCRIPTION="$(printf '%s' "${PR_BODY}" | head -c 400)"
+          if [ "$(printf '%s' "${PR_BODY}" | wc -c)" -gt 400 ]; then
+            DESCRIPTION="${DESCRIPTION}…"
+          fi
+
+          # jq builds the JSON so a title or body containing quotes, backticks or
+          # newlines cannot break the payload.
+          jq -n \
+            --arg title "${TITLE_PREFIX}: #${PR_NUMBER} ${PR_TITLE}" \
+            --arg url "${PR_URL}" \
+            --arg desc "${DESCRIPTION}" \
+            --arg author "${PR_AUTHOR}" \
+            --arg avatar "${PR_AVATAR}" \
+            --arg branches "\`${PR_HEAD}\` → \`${PR_BASE}\`" \
+            --arg changes "+${PR_ADDITIONS} / -${PR_DELETIONS} in ${PR_FILES} file(s)" \
+            --arg repo "${REPO}" \
+            --argjson color "${COLOR}" \
+            '{
+              username: "VITERAZ PR Bot",
+              embeds: [{
+                title: $title,
+                url: $url,
+                description: $desc,
+                color: $color,
+                author: { name: $author, icon_url: $avatar },
+                fields: [
+                  { name: "Branch",  value: $branches, inline: true },
+                  { name: "Changes", value: $changes,  inline: true }
+                ],
+                footer: { text: $repo },
+                timestamp: (now | todateiso8601)
+              }]
+            }' > payload.json
+
+          curl --silent --show-error --fail-with-body \
+            --retry 3 --retry-delay 2 \
+            -H "Content-Type: application/json" \
+            -X POST -d @payload.json \
+            "${WEBHOOK_URL}"
